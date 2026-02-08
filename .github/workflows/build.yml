@@ -3,11 +3,10 @@ name: Build Arch-Forge Repo
 on:
   push:
     paths:
-      - 'packages.txt'      # 修改包列表时触发
-      - '.github/workflows/**'
+      - 'packages.txt'
   schedule:
-    - cron: '0 2 * * 0'     # 每周日凌晨2点自动运行
-  workflow_dispatch:        # 支持手动点击运行
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -27,32 +26,28 @@ jobs:
 
       - name: Setup Arch Environment & US Mirrors
         run: |
-          # 初始化密钥环
+          # 初始化 Keyring
           pacman-key --init
           pacman-key --populate archlinux
           pacman -Sy --noconfirm archlinux-keyring
+          
+          # 安装必要工具 (pacman-contrib 包含 paccache 用于清理旧包)
+          pacman -S --noconfirm reflector git rsync sudo pacman-contrib
 
-          # 安装必要工具
-          pacman -S --noconfirm reflector git rsync sudo
-
-          # 自动筛选美国最快的 5 个 HTTPS 镜像源
+          # 自动筛选美国最快源
           echo "Selecting best US mirrors..."
           reflector --country 'United States' --age 12 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-          
-          # 同步系统
           pacman -Syyu --noconfirm
 
       - name: Setup Builder User
         run: |
-          # 创建非 root 用户用于编译
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          # 初始权限设置
+          # 确保 builder 对整个工作目录有初始权限
           chown -R builder:builder .
 
-      - name: Install Yay (AUR Helper)
+      - name: Install Yay
         run: |
-          # 编译安装 yay-bin 以处理 AUR 依赖
           sudo -u builder bash -c '
             cd /tmp
             git clone https://aur.archlinux.org/yay-bin.git
@@ -60,43 +55,43 @@ jobs:
             makepkg -si --noconfirm
           '
 
-      - name: Prepare Repo Directory
-        run: |
-          # 尝试拉取现有的 gh-pages 分支以实现增量更新
-          git config --global --add safe.directory /__w/${{ github.event.repository.name }}/${{ github.event.repository.name }}
-          mkdir -p repo_dir/x86_64
-          # 如果之前有构建好的包，这里可以保留，或者后续通过 keep_files 逻辑处理
-
       - name: Build Packages
         run: |
-          # 1. 显式创建并授权构建目录，解决之前的 'No such file or directory' 错误
+          # 【修复点 1】显式创建目录并授权
           mkdir -p tmp_build
+          mkdir -p repo_dir/x86_64
           chown -R builder:builder .
 
-          # 2. 读取 packages.txt
+          # 读取包名
           packages=$(cat packages.txt | tr '\n' ' ')
           echo "Target packages: $packages"
 
-          # 3. 使用 yay 进行编译
-          # --builddir 使用绝对路径确保稳定性
+          # 【修复点 2】使用绝对路径执行构建
           sudo -u builder yay -S --noconfirm --builddir=$(pwd)/tmp_build $packages
 
-          # 4. 提取生成的所有包文件
+          # 将编译好的包移入仓库目录
           find tmp_build -name "*.pkg.tar.zst" -exec cp {} ./repo_dir/x86_64/ \;
 
       - name: Update Repo Database
         run: |
-          cd repo_dir/x86_64
-          # 移除旧数据库索引（如果有）
-          rm -f arch-forge.db.tar.gz arch-forge.files.tar.gz
+          # 【修复点 3】强制将权限切回 root，确保 repo-add 有权写文件
+          chown -R root:root ./repo_dir
           
-          # 生成新的仓库索引
-          # -n: 仅添加新包, -R: 清理无效条目
+          cd repo_dir/x86_64
+          
+          # 检查是否有包生成，如果没有则报错停止，方便排查
+          ls -lh *.pkg.tar.zst || (echo "No packages found!" && exit 1)
+
+          # 清理超过 2 个的历史版本（防止磁盘满）
+          paccache -r -k 2 -c . || true
+
+          # 更新数据库
+          # 使用更稳健的参数：-n (只加新包), -R (移除旧链接)
           repo-add -n -R arch-forge.db.tar.gz *.pkg.tar.zst
           
-          # 兼容性处理：建立软链接或拷贝，确保 pacman 能识别 .db 后缀
-          cp arch-forge.db.tar.gz arch-forge.db
-          cp arch-forge.files.tar.gz arch-forge.files
+          # 确保 pacman 能通过标准 .db 文件名访问
+          cp -f arch-forge.db.tar.gz arch-forge.db
+          cp -f arch-forge.files.tar.gz arch-forge.files
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
@@ -104,4 +99,4 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./repo_dir
           publish_branch: gh-pages
-          keep_files: true  # 保持旧包，避免每次只剩下刚编译的那个
+          keep_files: true # 必须开启，否则每次构建都会删掉之前的包
