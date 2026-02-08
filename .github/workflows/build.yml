@@ -9,9 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: write # 必须赋予写入 Release 的权限
 
 jobs:
   build:
@@ -31,7 +29,7 @@ jobs:
           pacman -Sy --noconfirm archlinux-keyring
           pacman -S --noconfirm reflector git rsync sudo pacman-contrib
 
-          # 自动筛选美国最快源，确保下载依赖不卡顿
+          # 自动筛选美国最快源
           echo "Selecting best US mirrors..."
           reflector --country 'United States' --age 12 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
           pacman -Syyu --noconfirm
@@ -53,49 +51,49 @@ jobs:
 
       - name: Build Packages
         run: |
-          # 1. 确保目录存在且权限正确
+          # 创建必要目录
+          mkdir -p repo_output
           mkdir -p tmp_build
-          mkdir -p repo_dir/x86_64
           chown -R builder:builder .
 
-          # 2. 读取需要编译的包
+          # 读取并编译
           packages=$(cat packages.txt | tr '\n' ' ')
-          echo "Building: $packages"
-
-          # 3. 使用 yay 编译（自动处理所有依赖）
+          echo "Building targets: $packages"
           sudo -u builder yay -S --noconfirm --builddir=$(pwd)/tmp_build $packages
 
-          # 4. 收集生成的包文件
-          find tmp_build -name "*.pkg.tar.zst" -exec cp {} ./repo_dir/x86_64/ \;
+          # 收集所有生成的包（包括依赖包）
+          find tmp_build -name "*.pkg.tar.zst" -exec cp {} ./repo_output/ \;
 
       - name: Update Repo Database
         run: |
-          # 强制将权限设回 root 以执行数据库更新
-          chown -R root:root ./repo_dir
-          cd repo_dir/x86_64
+          cd repo_output
           
-          # 检查包是否存在
-          ls -lh *.pkg.tar.zst || (echo "No packages found!" && exit 1)
-
-          # 清理旧包，只保留最新的两个版本
-          paccache -r -k 2 -c . || true
-
-          # 【修复核心】先删除旧的数据库文件和可能的软链接
-          rm -f arch-forge.db arch-forge.db.tar.gz arch-forge.files arch-forge.files.tar.gz
-          
-          # 生成新的仓库索引
+          # 生成仓库数据库文件
+          # -n: 仅增加新包，-R: 移除旧包链接
           repo-add -n -R arch-forge.db.tar.gz *.pkg.tar.zst
           
-          # 【修复核心】删除 repo-add 自动生成的软链接，改为拷贝实体文件
-          # 这样可以避免 "same file" 报错，且对 GitHub Pages 更友好
+          # 处理数据库文件链接问题，方便后续直接引用
           rm -f arch-forge.db arch-forge.files
           cp arch-forge.db.tar.gz arch-forge.db
           cp arch-forge.files.tar.gz arch-forge.files
+          
+          echo "Build complete. Files in repo_output:"
+          ls -lh
 
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./repo_dir
-          publish_branch: gh-pages
-          keep_files: true
+          tag_name: latest
+          name: "Arch-Forge Repository (Latest Build)"
+          body: |
+            This release contains the latest pre-compiled Arch Linux packages from AUR.
+            Updated on: ${{ github.event.head_commit.timestamp || 'Manual Trigger' }}
+          files: |
+            repo_output/*.pkg.tar.zst
+            repo_output/arch-forge.db
+            repo_output/arch-forge.files
+          # 设为 true 会在每次运行时覆盖旧的 Release 文件
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
