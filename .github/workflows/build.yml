@@ -26,15 +26,12 @@ jobs:
 
       - name: Setup Arch Environment & US Mirrors
         run: |
-          # 初始化 Keyring
           pacman-key --init
           pacman-key --populate archlinux
           pacman -Sy --noconfirm archlinux-keyring
-          
-          # 安装必要工具 (pacman-contrib 包含 paccache 用于清理旧包)
           pacman -S --noconfirm reflector git rsync sudo pacman-contrib
 
-          # 自动筛选美国最快源
+          # 自动筛选美国最快源，确保下载依赖不卡顿
           echo "Selecting best US mirrors..."
           reflector --country 'United States' --age 12 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
           pacman -Syyu --noconfirm
@@ -43,10 +40,9 @@ jobs:
         run: |
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          # 确保 builder 对整个工作目录有初始权限
           chown -R builder:builder .
 
-      - name: Install Yay
+      - name: Install Yay (AUR Helper)
         run: |
           sudo -u builder bash -c '
             cd /tmp
@@ -57,41 +53,44 @@ jobs:
 
       - name: Build Packages
         run: |
-          # 【修复点 1】显式创建目录并授权
+          # 1. 确保目录存在且权限正确
           mkdir -p tmp_build
           mkdir -p repo_dir/x86_64
           chown -R builder:builder .
 
-          # 读取包名
+          # 2. 读取需要编译的包
           packages=$(cat packages.txt | tr '\n' ' ')
-          echo "Target packages: $packages"
+          echo "Building: $packages"
 
-          # 【修复点 2】使用绝对路径执行构建
+          # 3. 使用 yay 编译（自动处理所有依赖）
           sudo -u builder yay -S --noconfirm --builddir=$(pwd)/tmp_build $packages
 
-          # 将编译好的包移入仓库目录
+          # 4. 收集生成的包文件
           find tmp_build -name "*.pkg.tar.zst" -exec cp {} ./repo_dir/x86_64/ \;
 
       - name: Update Repo Database
         run: |
-          # 【修复点 3】强制将权限切回 root，确保 repo-add 有权写文件
+          # 强制将权限设回 root 以执行数据库更新
           chown -R root:root ./repo_dir
-          
           cd repo_dir/x86_64
           
-          # 检查是否有包生成，如果没有则报错停止，方便排查
+          # 检查包是否存在
           ls -lh *.pkg.tar.zst || (echo "No packages found!" && exit 1)
 
-          # 清理超过 2 个的历史版本（防止磁盘满）
+          # 清理旧包，只保留最新的两个版本
           paccache -r -k 2 -c . || true
 
-          # 更新数据库
-          # 使用更稳健的参数：-n (只加新包), -R (移除旧链接)
+          # 【修复核心】先删除旧的数据库文件和可能的软链接
+          rm -f arch-forge.db arch-forge.db.tar.gz arch-forge.files arch-forge.files.tar.gz
+          
+          # 生成新的仓库索引
           repo-add -n -R arch-forge.db.tar.gz *.pkg.tar.zst
           
-          # 确保 pacman 能通过标准 .db 文件名访问
-          cp -f arch-forge.db.tar.gz arch-forge.db
-          cp -f arch-forge.files.tar.gz arch-forge.files
+          # 【修复核心】删除 repo-add 自动生成的软链接，改为拷贝实体文件
+          # 这样可以避免 "same file" 报错，且对 GitHub Pages 更友好
+          rm -f arch-forge.db arch-forge.files
+          cp arch-forge.db.tar.gz arch-forge.db
+          cp arch-forge.files.tar.gz arch-forge.files
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
@@ -99,4 +98,4 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./repo_dir
           publish_branch: gh-pages
-          keep_files: true # 必须开启，否则每次构建都会删掉之前的包
+          keep_files: true
